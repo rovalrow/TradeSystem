@@ -1,108 +1,133 @@
-# ── app.py ────────────────────────────────────────────────────────────
-"""
-Stateless-style trading API for two players who are **in-game at the same
-time**.  Each player is identified by their Roblox name string.
-
-┌────────┐          set_target          ┌────────┐
-│ Alice  │ ───────────────────────────► │ Bob    │
-└────────┘ ◄─────────────────────────── └────────┘
-          offer / remove / accept  (live-polled)
-
-When BOTH sides .accepted == True the clients will:
-  1. equip every item they offered
-  2. FireServer('GivePet', otherPlayer) for each item (client side)
-  3. POST /reset so a new trade can start
-"""
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import threading, time
+from supabase import create_client, Client
+import os
+import datetime
+import threading
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-# ──────────────────────────────────────────────────────────────────────
-# In-memory “DB”.  Key = player name.  (If you deploy to production,
-# switch to Redis / Dynamo / Postgres so data isn’t lost on restart.)
-#   { player : {target:str, offer:list[str], accepted:bool, ts:float } }
-trades = {}
-OFFER_TTL = 30 * 60          # 30 minutes until stale trade auto-clears
+# Supabase environment variables (configure in Render)
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Helpers ­–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
-def fresh(p):                           # ensure entry exists & isn’t stale
-    now = time.time()
-    if p not in trades or now - trades[p]["ts"] > OFFER_TTL:
-        trades[p] = {"target":"", "offer":[], "accepted":False, "ts":now}
-    trades[p]["ts"] = now
-    return trades[p]
+OFFER_TTL = 30 * 60  # 30 minutes
 
-def counterpart(p):
-    tgt = trades.get(p, {}).get("target")
-    if tgt and trades.get(tgt, {}).get("target") == p:
-        return tgt
+def fresh(player):
+    now = datetime.datetime.utcnow().isoformat()
+    res = supabase.table("trades").select("*").eq("player", player).execute()
+    if not res.data:
+        supabase.table("trades").insert({
+            "player": player,
+            "target": "",
+            "offer": [],
+            "accepted": False,
+            "updated_at": now
+        }).execute()
+    else:
+        supabase.table("trades").update({"updated_at": now}).eq("player", player).execute()
+
+def get_counterpart(player):
+    res = supabase.table("trades").select("target").eq("player", player).execute()
+    if not res.data:
+        return None
+    target = res.data[0].get("target")
+    if not target:
+        return None
+    reverse = supabase.table("trades").select("target").eq("player", target).execute()
+    if reverse.data and reverse.data[0].get("target") == player:
+        return target
     return None
 
-# Routes ­–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 @app.route("/set_target", methods=["POST"])
 def set_target():
     d = request.get_json()
     user, target = d["user"], d["target"]
-    fresh(user)["target"] = target
+    fresh(user)
+    supabase.table("trades").update({
+        "target": target,
+        "updated_at": datetime.datetime.utcnow().isoformat()
+    }).eq("player", user).execute()
     return jsonify(ok=True)
 
 @app.route("/offer", methods=["POST"])
 def add_offer():
     d = request.get_json()
     user, item = d["user"], d["item"]
-    u = fresh(user)
-    if item not in u["offer"]:
-        u["offer"].append(item)
-    return jsonify(ok=True, offer=u["offer"])
+    fresh(user)
+    current = supabase.table("trades").select("offer").eq("player", user).single().execute()
+    offer = current.data["offer"] or []
+    if item not in offer:
+        offer.append(item)
+    supabase.table("trades").update({
+        "offer": offer,
+        "updated_at": datetime.datetime.utcnow().isoformat()
+    }).eq("player", user).execute()
+    return jsonify(ok=True, offer=offer)
 
 @app.route("/remove_offer", methods=["POST"])
 def remove_offer():
     d = request.get_json()
     user, item = d["user"], d["item"]
-    u = fresh(user)
-    if item in u["offer"]:
-        u["offer"].remove(item)
-    return jsonify(ok=True, offer=u["offer"])
+    fresh(user)
+    current = supabase.table("trades").select("offer").eq("player", user).single().execute()
+    offer = current.data["offer"] or []
+    if item in offer:
+        offer.remove(item)
+    supabase.table("trades").update({
+        "offer": offer,
+        "updated_at": datetime.datetime.utcnow().isoformat()
+    }).eq("player", user).execute()
+    return jsonify(ok=True, offer=offer)
 
 @app.route("/accept", methods=["POST"])
 def accept():
     d = request.get_json()
-    fresh(d["user"])["accepted"] = True
+    user = d["user"]
+    fresh(user)
+    supabase.table("trades").update({
+        "accepted": True,
+        "updated_at": datetime.datetime.utcnow().isoformat()
+    }).eq("player", user).execute()
     return jsonify(ok=True)
 
 @app.route("/status", methods=["GET"])
 def status():
-    user = request.args["user"]
-    u = fresh(user)
-    other = counterpart(user)
-    both = other and u["accepted"] and trades[other]["accepted"]
+    user = request.args.get("user")
+    fresh(user)
+    mine = supabase.table("trades").select("*").eq("player", user).single().execute().data
+    other_name = get_counterpart(user)
+    other = None
+    if other_name:
+        other = supabase.table("trades").select("*").eq("player", other_name).single().execute().data
+    both = other and mine["accepted"] and other["accepted"]
     return jsonify(
-        other=other,
-        myOffer=u["offer"],
-        otherOffer=trades.get(other, {}).get("offer", []),
-        iAccepted=u["accepted"],
-        otherAccepted=trades.get(other, {}).get("accepted", False),
+        other=other_name,
+        myOffer=mine["offer"],
+        otherOffer=other["offer"] if other else [],
+        iAccepted=mine["accepted"],
+        otherAccepted=other["accepted"] if other else False,
         bothAccepted=both
     )
 
 @app.route("/reset", methods=["POST"])
 def reset():
     d = request.get_json()
-    trades.pop(d["user"], None)
+    user = d["user"]
+    supabase.table("trades").delete().eq("player", user).execute()
     return jsonify(ok=True)
 
-# Optional: background task to purge stale sessions
 def janitor():
     while True:
         time.sleep(60)
-        now = time.time()
-        stale = [p for p,v in trades.items() if now - v["ts"] > OFFER_TTL]
-        for p in stale: trades.pop(p, None)
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(seconds=OFFER_TTL)).isoformat()
+        supabase.table("trades").delete().lt("updated_at", cutoff).execute()
+
 threading.Thread(target=janitor, daemon=True).start()
 
 if __name__ == "__main__":
     app.run("0.0.0.0", 5000)
-# ──────────────────────────────────────────────────────────────────────
+          
