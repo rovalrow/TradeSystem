@@ -10,7 +10,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Supabase environment variables (configure in Render)
-SUPABASE_URL = os.environ.get("https://ikxxvgflnpfyncnaqfxx.supabase.co")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ikxxvgflnpfyncnaqfxx.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlreHh2Z2ZsbnBmeW5jbmFxZnh4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDYxOTE3NTMsImV4cCI6MjA2MTc2Nzc1M30.YiF46ggItUYuKLfdD_6oOxq2xGX7ac6yqqtEGeM_dg8")  # ⚠️ You may want to remove hardcoded key for security
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
